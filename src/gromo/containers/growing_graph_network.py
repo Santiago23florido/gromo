@@ -39,6 +39,72 @@ GrowthInitializationStrategy: TypeAlias = Literal[
 ExplicitGrowthInitMode: TypeAlias = Literal["kaiming", "zeros"]
 
 
+class _ExtendedPostMergeFunctionAdapter(nn.Module):
+    """Mirror local growth post-merge handling during candidate evaluation."""
+
+    def __init__(
+        self,
+        post_merge_function: nn.Module,
+        base_features: int,
+        extension_features: int,
+    ) -> None:
+        super().__init__()
+        self.post_merge_function = post_merge_function
+        self.base_features = base_features
+        self.extension_features = extension_features
+        self._expect_extension = False
+
+    def forward(self, x: torch.Tensor | None) -> torch.Tensor | None:
+        """Apply the normal branch or the candidate-extension branch."""
+        if x is None:
+            self._expect_extension = False
+            return None
+
+        if self._is_extension_tensor(x):
+            self._expect_extension = False
+            return self._apply_to_extension(x)
+
+        self._expect_extension = True
+        return self.post_merge_function(x)
+
+    def _is_extension_tensor(self, x: torch.Tensor) -> bool:
+        if x.dim() < 2:
+            return False
+        feature_dim = x.shape[1]
+        if self._expect_extension:
+            return not (
+                feature_dim == self.base_features
+                and self.base_features != self.extension_features
+            )
+        return (
+            feature_dim == self.extension_features
+            and self.base_features != self.extension_features
+        )
+
+    def _apply_to_extension(self, x_ext: torch.Tensor) -> torch.Tensor | None:
+        post_merge_function = self.post_merge_function
+        if isinstance(post_merge_function, nn.Sequential):
+            for module in post_merge_function:
+                # Local growth optimizes candidate blocks with growable
+                # post-merge modules treated as identity on the extension.
+                if hasattr(module, "grow"):
+                    continue
+                if hasattr(module, "extended_forward"):
+                    _, x_ext = module.extended_forward(None, x_ext)
+                elif x_ext is not None:
+                    x_ext = module(x_ext)
+            return x_ext
+
+        if hasattr(post_merge_function, "grow"):
+            return x_ext
+
+        if hasattr(post_merge_function, "extended_forward"):
+            _, x_ext = post_merge_function.extended_forward(None, x_ext)
+            return x_ext
+
+        return post_merge_function(x_ext)
+
+
 class GrowingGraphNetwork(GrowingContainer):
     """Growing DAG Network
 
@@ -156,6 +222,7 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def delete_update(self) -> None:
         """Delete tensor updates"""
+        self._restore_init_scaling_post_merge_functions()
         self.dag.delete_update()
 
     def update_size(self) -> None:
@@ -181,6 +248,8 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def reset_network(self) -> None:
         """Reset graph to empty"""
+        if hasattr(self, "dag"):
+            self._restore_init_scaling_post_merge_functions()
         self.init_empty_graph()
         self.global_step = 0
         self.global_epoch = 0
@@ -675,6 +744,60 @@ class GrowingGraphNetwork(GrowingContainer):
         )
 
     @staticmethod
+    def _restore_init_scaling_post_merge_functions_in_dag(dag: GrowingDAG) -> None:
+        """Restore post-merge functions wrapped for candidate evaluation."""
+        for node in list(dag.nodes):
+            merge_module = dag.get_node_module(node)
+            original = getattr(
+                merge_module, "_init_scaling_original_post_merge_function", None
+            )
+            if original is None:
+                continue
+            merge_module.post_merge_function = original
+            delattr(merge_module, "_init_scaling_original_post_merge_function")
+
+    def _restore_init_scaling_post_merge_functions(self) -> None:
+        """Restore temporary ablation wrappers on this graph."""
+        self._restore_init_scaling_post_merge_functions_in_dag(self.dag)
+
+    @classmethod
+    def _restore_init_scaling_post_merge_functions_for_options(
+        cls,
+        options: Sequence[Expansion],
+    ) -> None:
+        """Restore temporary wrappers on every candidate DAG."""
+        for option in options:
+            cls._restore_init_scaling_post_merge_functions_in_dag(option.dag)
+
+    @staticmethod
+    def _wrap_expansion_post_merge_function(
+        expansion: Expansion,
+        extension_size: int,
+    ) -> None:
+        """Wrap merge post-processing while candidate extensions are evaluated."""
+        if expansion.type == ExpansionType.NEW_EDGE:
+            return
+        expanding_node = expansion.expanding_node
+        if expanding_node not in expansion.dag.nodes:
+            return
+
+        merge_module = expansion.dag.get_node_module(expanding_node)
+        if isinstance(
+            merge_module.post_merge_function,
+            _ExtendedPostMergeFunctionAdapter,
+        ):
+            return
+
+        merge_module._init_scaling_original_post_merge_function = (  # type: ignore[attr-defined]
+            merge_module.post_merge_function
+        )
+        merge_module.post_merge_function = _ExtendedPostMergeFunctionAdapter(
+            post_merge_function=merge_module.post_merge_function,
+            base_features=int(expansion.dag.nodes[expanding_node]["size"]),
+            extension_features=extension_size,
+        )
+
+    @staticmethod
     @torch.no_grad()
     def _initialise_weight_from_mode(
         edge: GrowingModule,
@@ -814,6 +937,7 @@ class GrowingGraphNetwork(GrowingContainer):
                 cls._create_input_extension_from_mode(edge, extension_size, outgoing_init)
             edge.scaling_factor = 1.0
 
+        cls._wrap_expansion_post_merge_function(expansion, extension_size)
         expansion.metrics["active_neurons"] = extension_size
 
     def update_edge_weights(
@@ -1255,6 +1379,8 @@ class GrowingGraphNetwork(GrowingContainer):
             list of all possible extensions
         """
         assert self.chosen_action is not None
+        self._restore_init_scaling_post_merge_functions()
+        self._restore_init_scaling_post_merge_functions_for_options(options)
 
         # Make selected nodes and edges non candidate
         if self.chosen_action.dag == self.dag:
@@ -1306,6 +1432,7 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def apply_change(self) -> None:
         """Apply all changes to the graph"""
+        self._restore_init_scaling_post_merge_functions()
         # Apply changes
         for prev_node, next_node in self.dag.edges:
             factor = self.chosen_action.metrics["scaling_factor"]
