@@ -1,7 +1,7 @@
 import copy
 import operator
 import warnings
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Literal, Sequence, TypeAlias
 
 import numpy as np
 import torch
@@ -30,6 +30,13 @@ from gromo.utils.utils import (
     line_search,
     mini_batch_gradient_descent,
 )
+
+
+GrowthInitializationStrategy: TypeAlias = Literal[
+    "local",
+    "init_scaling_ablation",
+]
+ExplicitGrowthInitMode: TypeAlias = Literal["kaiming", "zeros"]
 
 
 class GrowingGraphNetwork(GrowingContainer):
@@ -640,24 +647,39 @@ class GrowingGraphNetwork(GrowingContainer):
         return loss_history
 
     @staticmethod
-    def _normalise_explicit_init_mode(mode: str) -> str:
+    def _normalise_initialization_strategy(
+        initialization_strategy: str,
+    ) -> GrowthInitializationStrategy:
+        """Validate the high-level DAG growth initialization strategy."""
+        normalised = str(initialization_strategy).lower().strip()
+        if normalised == "local":
+            return "local"
+        if normalised == "init_scaling_ablation":
+            return "init_scaling_ablation"
+        raise ValueError(
+            f"Unsupported initialization_strategy={initialization_strategy!r}. "
+            "Expected 'local' or 'init_scaling_ablation'."
+        )
+
+    @staticmethod
+    def _normalise_explicit_init_mode(mode: str) -> ExplicitGrowthInitMode:
         """Validate explicit tensor init modes used when local init is disabled."""
-        supported_modes = {"kaiming", "zeros"}
         normalised = str(mode).lower().strip()
-        if normalised not in supported_modes:
-            supported = ", ".join(sorted(supported_modes))
-            raise ValueError(
-                f"Unsupported growth initialization mode {mode!r}. "
-                f"Expected one of: {supported}"
-            )
-        return normalised
+        if normalised == "kaiming":
+            return "kaiming"
+        if normalised == "zeros":
+            return "zeros"
+        raise ValueError(
+            f"Unsupported growth initialization mode {mode!r}. "
+            "Expected one of: kaiming, zeros"
+        )
 
     @staticmethod
     @torch.no_grad()
     def _initialise_weight_from_mode(
         edge: GrowingModule,
         weight: torch.Tensor,
-        mode: str,
+        mode: ExplicitGrowthInitMode,
         *,
         fan_in: int,
     ) -> None:
@@ -675,7 +697,7 @@ class GrowingGraphNetwork(GrowingContainer):
     def _initialise_new_edge_from_mode(
         cls,
         edge: GrowingModule,
-        mode: str,
+        mode: ExplicitGrowthInitMode,
     ) -> None:
         """Create the delta layer for a direct NEW_EDGE action."""
         weight = torch.empty_like(edge.weight)
@@ -696,7 +718,7 @@ class GrowingGraphNetwork(GrowingContainer):
         cls,
         edge: GrowingModule,
         extension_size: int,
-        mode: str,
+        mode: ExplicitGrowthInitMode,
     ) -> None:
         """Create the incoming-side extension for node growth."""
         weight = torch.empty(
@@ -725,7 +747,7 @@ class GrowingGraphNetwork(GrowingContainer):
         cls,
         edge: GrowingModule,
         extension_size: int,
-        mode: str,
+        mode: ExplicitGrowthInitMode,
     ) -> None:
         """Create the outgoing-side extension for node growth."""
         weight = torch.empty(
@@ -753,9 +775,9 @@ class GrowingGraphNetwork(GrowingContainer):
         cls,
         expansion: Expansion,
         extension_size: int,
-        incoming_init: str = "kaiming",
-        outgoing_init: str = "zeros",
-        new_edge_init: str = "zeros",
+        incoming_init: ExplicitGrowthInitMode = "kaiming",
+        outgoing_init: ExplicitGrowthInitMode = "zeros",
+        new_edge_init: ExplicitGrowthInitMode = "zeros",
     ) -> None:
         """Initialize a DAG expansion without running the local initializer."""
         incoming_init = cls._normalise_explicit_init_mode(incoming_init)
@@ -979,10 +1001,10 @@ class GrowingGraphNetwork(GrowingContainer):
         dev_dataloader: DataLoader = None,
         val_dataloader: DataLoader = None,
         verbose: bool = False,
-        initialization_strategy: str = "local",
-        incoming_init: str = "kaiming",
-        outgoing_init: str = "zeros",
-        new_edge_init: str = "zeros",
+        initialization_strategy: GrowthInitializationStrategy = "local",
+        incoming_init: ExplicitGrowthInitMode = "kaiming",
+        outgoing_init: ExplicitGrowthInitMode = "zeros",
+        new_edge_init: ExplicitGrowthInitMode = "zeros",
     ) -> None:
         """Execute all DAG expansions and save statistics
 
@@ -1008,22 +1030,23 @@ class GrowingGraphNetwork(GrowingContainer):
             validation dataloader, used if evaluate=True
         verbose : bool, optional
             print info, by default False
-        initialization_strategy : str, optional
+        initialization_strategy : GrowthInitializationStrategy, optional
             "local" keeps the standard learned initialization. "init_scaling_ablation"
             skips it and initializes each candidate directly from the init modes.
-        incoming_init : str, optional
+        incoming_init : ExplicitGrowthInitMode, optional
             Incoming-edge initialization for "init_scaling_ablation".
-        outgoing_init : str, optional
+        outgoing_init : ExplicitGrowthInitMode, optional
             Outgoing-edge initialization for "init_scaling_ablation".
-        new_edge_init : str, optional
+        new_edge_init : ExplicitGrowthInitMode, optional
             Direct-edge initialization for "init_scaling_ablation".
         """
-        initialization_strategy = str(initialization_strategy).lower().strip()
-        if initialization_strategy not in {"local", "init_scaling_ablation"}:
-            raise ValueError(
-                f"Unsupported initialization_strategy={initialization_strategy!r}. "
-                "Expected 'local' or 'init_scaling_ablation'."
-            )
+        initialization_strategy = self._normalise_initialization_strategy(
+            initialization_strategy
+        )
+        if initialization_strategy == "init_scaling_ablation":
+            incoming_init = self._normalise_explicit_init_mode(incoming_init)
+            outgoing_init = self._normalise_explicit_init_mode(outgoing_init)
+            new_edge_init = self._normalise_explicit_init_mode(new_edge_init)
 
         if amplitude_factor:
             assert dev_dataloader is not None, (
