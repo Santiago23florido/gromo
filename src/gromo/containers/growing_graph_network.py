@@ -19,6 +19,7 @@ from gromo.containers.growing_dag import (
 from gromo.modules.conv2d_growing_module import (
     Conv2dGrowingModule,
 )
+from gromo.modules.growing_module import GrowingModule
 from gromo.modules.linear_growing_module import (
     LinearGrowingModule,
     LinearMergeGrowingModule,
@@ -638,6 +639,161 @@ class GrowingGraphNetwork(GrowingContainer):
 
         return loss_history
 
+    @staticmethod
+    def _normalise_explicit_init_mode(mode: str) -> str:
+        """Validate explicit tensor init modes used when local init is disabled."""
+        supported_modes = {"kaiming", "zeros"}
+        normalised = str(mode).lower().strip()
+        if normalised not in supported_modes:
+            supported = ", ".join(sorted(supported_modes))
+            raise ValueError(
+                f"Unsupported growth initialization mode {mode!r}. "
+                f"Expected one of: {supported}"
+            )
+        return normalised
+
+    @staticmethod
+    @torch.no_grad()
+    def _initialise_weight_from_mode(
+        edge: GrowingModule,
+        weight: torch.Tensor,
+        mode: str,
+        *,
+        fan_in: int,
+    ) -> None:
+        """Initialize a raw tensor using one of the explicit init modes."""
+        if mode == "kaiming":
+            edge.kaiming_initialization(weight, None, fan_in)
+            return
+        if mode == "zeros":
+            torch.nn.init.zeros_(weight)
+            return
+        raise ValueError(f"Unsupported growth initialization mode {mode!r}")
+
+    @classmethod
+    @torch.no_grad()
+    def _initialise_new_edge_from_mode(
+        cls,
+        edge: GrowingModule,
+        mode: str,
+    ) -> None:
+        """Create the delta layer for a direct NEW_EDGE action."""
+        weight = torch.empty_like(edge.weight)
+        cls._initialise_weight_from_mode(
+            edge,
+            weight,
+            mode,
+            fan_in=edge.get_fan_in_from_layer(edge.layer),
+        )
+        bias = None
+        if edge.use_bias and getattr(edge.layer, "bias", None) is not None:
+            bias = torch.zeros_like(edge.layer.bias)
+        edge.optimal_delta_layer = edge.layer_of_tensor(weight, bias)
+
+    @classmethod
+    @torch.no_grad()
+    def _create_output_extension_from_mode(
+        cls,
+        edge: GrowingModule,
+        extension_size: int,
+        mode: str,
+    ) -> None:
+        """Create the incoming-side extension for node growth."""
+        weight = torch.empty(
+            (extension_size, *edge.weight.shape[1:]),
+            device=edge.weight.device,
+            dtype=edge.weight.dtype,
+        )
+        cls._initialise_weight_from_mode(
+            edge,
+            weight,
+            mode,
+            fan_in=edge.get_fan_in_from_layer(edge.layer),
+        )
+        bias = None
+        if edge.use_bias and getattr(edge.layer, "bias", None) is not None:
+            bias = torch.zeros(
+                extension_size,
+                device=edge.layer.bias.device,
+                dtype=edge.layer.bias.dtype,
+            )
+        edge.extended_output_layer = edge.layer_of_tensor(weight, bias)
+
+    @classmethod
+    @torch.no_grad()
+    def _create_input_extension_from_mode(
+        cls,
+        edge: GrowingModule,
+        extension_size: int,
+        mode: str,
+    ) -> None:
+        """Create the outgoing-side extension for node growth."""
+        weight = torch.empty(
+            (edge.weight.shape[0], extension_size, *edge.weight.shape[2:]),
+            device=edge.weight.device,
+            dtype=edge.weight.dtype,
+        )
+        extension_fan_in = edge.get_fan_in_from_layer(num_neurons=extension_size)
+        base_fan_in = edge.get_fan_in_from_layer(edge.layer)
+        cls._initialise_weight_from_mode(
+            edge,
+            weight,
+            mode,
+            fan_in=extension_fan_in + base_fan_in,
+        )
+        edge.extended_input_layer = edge.layer_of_tensor(
+            weight,
+            bias=None,
+            force_bias=False,
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def initialise_expansion_from_modes(
+        cls,
+        expansion: Expansion,
+        extension_size: int,
+        incoming_init: str = "kaiming",
+        outgoing_init: str = "zeros",
+        new_edge_init: str = "zeros",
+    ) -> None:
+        """Initialize a DAG expansion without running the local initializer."""
+        incoming_init = cls._normalise_explicit_init_mode(incoming_init)
+        outgoing_init = cls._normalise_explicit_init_mode(outgoing_init)
+        new_edge_init = cls._normalise_explicit_init_mode(new_edge_init)
+
+        expansion.metrics["skip"] = False
+        expansion.metrics["initialization_strategy"] = "init_scaling_ablation"
+        expansion.metrics["incoming_init"] = incoming_init
+        expansion.metrics["outgoing_init"] = outgoing_init
+        expansion.metrics["new_edge_init"] = new_edge_init
+
+        if expansion.type == ExpansionType.NEW_EDGE:
+            for edge in expansion.in_edges:
+                cls._initialise_new_edge_from_mode(edge, new_edge_init)
+            expansion.metrics["active_neurons"] = 0
+            return
+
+        if extension_size <= 0:
+            raise ValueError(
+                f"Explicit DAG growth initialization requires a positive "
+                f"extension size, got {extension_size}."
+            )
+
+        for edge in expansion.in_edges:
+            if edge.extended_output_layer is None:
+                cls._create_output_extension_from_mode(
+                    edge, extension_size, incoming_init
+                )
+            edge.output_extension_scaling = 1.0
+
+        for edge in expansion.out_edges:
+            if edge.extended_input_layer is None:
+                cls._create_input_extension_from_mode(edge, extension_size, outgoing_init)
+            edge.scaling_factor = 1.0
+
+        expansion.metrics["active_neurons"] = extension_size
+
     def update_edge_weights(
         self,
         expansion: Expansion,
@@ -823,6 +979,10 @@ class GrowingGraphNetwork(GrowingContainer):
         dev_dataloader: DataLoader = None,
         val_dataloader: DataLoader = None,
         verbose: bool = False,
+        initialization_strategy: str = "local",
+        incoming_init: str = "kaiming",
+        outgoing_init: str = "zeros",
+        new_edge_init: str = "zeros",
     ) -> None:
         """Execute all DAG expansions and save statistics
 
@@ -848,7 +1008,23 @@ class GrowingGraphNetwork(GrowingContainer):
             validation dataloader, used if evaluate=True
         verbose : bool, optional
             print info, by default False
+        initialization_strategy : str, optional
+            "local" keeps the standard learned initialization. "init_scaling_ablation"
+            skips it and initializes each candidate directly from the init modes.
+        incoming_init : str, optional
+            Incoming-edge initialization for "init_scaling_ablation".
+        outgoing_init : str, optional
+            Outgoing-edge initialization for "init_scaling_ablation".
+        new_edge_init : str, optional
+            Direct-edge initialization for "init_scaling_ablation".
         """
+        initialization_strategy = str(initialization_strategy).lower().strip()
+        if initialization_strategy not in {"local", "init_scaling_ablation"}:
+            raise ValueError(
+                f"Unsupported initialization_strategy={initialization_strategy!r}. "
+                "Expected 'local' or 'init_scaling_ablation'."
+            )
+
         if amplitude_factor:
             assert dev_dataloader is not None, (
                 "Development DataLoader should be given if amplitude_factor is True"
@@ -878,13 +1054,23 @@ class GrowingGraphNetwork(GrowingContainer):
                     self.global_step,
                 )
 
-                # Update weight of next_node's incoming edge
-                bott_loss_history = self.update_edge_weights(
-                    expansion=expansion,
-                    bottlenecks=bottleneck,
-                    activities=input_B,
-                    verbose=verbose,
-                )
+                if initialization_strategy == "init_scaling_ablation":
+                    self.initialise_expansion_from_modes(
+                        expansion=expansion,
+                        extension_size=self.neurons,
+                        incoming_init=incoming_init,
+                        outgoing_init=outgoing_init,
+                        new_edge_init=new_edge_init,
+                    )
+                    bott_loss_history = [0.0]
+                else:
+                    # Update weight of next_node's incoming edge
+                    bott_loss_history = self.update_edge_weights(
+                        expansion=expansion,
+                        bottlenecks=bottleneck,
+                        activities=input_B,
+                        verbose=verbose,
+                    )
 
             # Create/Expand node
             elif (expansion.type == ExpansionType.NEW_NODE) or (
@@ -896,14 +1082,24 @@ class GrowingGraphNetwork(GrowingContainer):
                     self.global_step,
                 )
 
-                # Update weights of new edges
-                bott_loss_history = self.expand_node(
-                    expansion=expansion,
-                    bottlenecks=bottleneck,
-                    activities=input_B,
-                    neuron_selection_threshold=neuron_selection_threshold,
-                    verbose=verbose,
-                )
+                if initialization_strategy == "init_scaling_ablation":
+                    self.initialise_expansion_from_modes(
+                        expansion=expansion,
+                        extension_size=self.neurons,
+                        incoming_init=incoming_init,
+                        outgoing_init=outgoing_init,
+                        new_edge_init=new_edge_init,
+                    )
+                    bott_loss_history = [0.0]
+                else:
+                    # Update weights of new edges
+                    bott_loss_history = self.expand_node(
+                        expansion=expansion,
+                        bottlenecks=bottleneck,
+                        activities=input_B,
+                        neuron_selection_threshold=neuron_selection_threshold,
+                        verbose=verbose,
+                    )
                 if expansion.metrics.get("skip", False):
                     continue
 
