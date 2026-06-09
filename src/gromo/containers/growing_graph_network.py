@@ -32,77 +32,7 @@ from gromo.utils.utils import (
 )
 
 
-GrowthInitializationStrategy: TypeAlias = Literal[
-    "local",
-    "init_scaling_ablation",
-]
 ExplicitGrowthInitMode: TypeAlias = Literal["kaiming", "zeros"]
-
-
-class _ExtendedPostMergeFunctionAdapter(nn.Module):
-    """Mirror local growth post-merge handling during candidate evaluation."""
-
-    def __init__(
-        self,
-        post_merge_function: nn.Module,
-        base_features: int,
-        extension_features: int,
-    ) -> None:
-        super().__init__()
-        self.post_merge_function = post_merge_function
-        self.base_features = base_features
-        self.extension_features = extension_features
-        self._expect_extension = False
-
-    def forward(self, x: torch.Tensor | None) -> torch.Tensor | None:
-        """Apply the normal branch or the candidate-extension branch."""
-        if x is None:
-            self._expect_extension = False
-            return None
-
-        if self._is_extension_tensor(x):
-            self._expect_extension = False
-            return self._apply_to_extension(x)
-
-        self._expect_extension = True
-        return self.post_merge_function(x)
-
-    def _is_extension_tensor(self, x: torch.Tensor) -> bool:
-        if x.dim() < 2:
-            return False
-        feature_dim = x.shape[1]
-        if self._expect_extension:
-            return not (
-                feature_dim == self.base_features
-                and self.base_features != self.extension_features
-            )
-        return (
-            feature_dim == self.extension_features
-            and self.base_features != self.extension_features
-        )
-
-    def _apply_to_extension(self, x_ext: torch.Tensor) -> torch.Tensor | None:
-        post_merge_function = self.post_merge_function
-        if isinstance(post_merge_function, nn.Sequential):
-            for module in post_merge_function:
-                # Local growth optimizes candidate blocks with growable
-                # post-merge modules treated as identity on the extension.
-                if hasattr(module, "grow"):
-                    continue
-                if hasattr(module, "extended_forward"):
-                    _, x_ext = module.extended_forward(None, x_ext)
-                elif x_ext is not None:
-                    x_ext = module(x_ext)
-            return x_ext
-
-        if hasattr(post_merge_function, "grow"):
-            return x_ext
-
-        if hasattr(post_merge_function, "extended_forward"):
-            _, x_ext = post_merge_function.extended_forward(None, x_ext)
-            return x_ext
-
-        return post_merge_function(x_ext)
 
 
 class GrowingGraphNetwork(GrowingContainer):
@@ -222,7 +152,6 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def delete_update(self) -> None:
         """Delete tensor updates"""
-        self._restore_init_scaling_post_merge_functions()
         self.dag.delete_update()
 
     def update_size(self) -> None:
@@ -248,8 +177,6 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def reset_network(self) -> None:
         """Reset graph to empty"""
-        if hasattr(self, "dag"):
-            self._restore_init_scaling_post_merge_functions()
         self.init_empty_graph()
         self.global_step = 0
         self.global_epoch = 0
@@ -716,21 +643,6 @@ class GrowingGraphNetwork(GrowingContainer):
         return loss_history
 
     @staticmethod
-    def _normalise_initialization_strategy(
-        initialization_strategy: str,
-    ) -> GrowthInitializationStrategy:
-        """Validate the high-level DAG growth initialization strategy."""
-        normalised = str(initialization_strategy).lower().strip()
-        if normalised == "local":
-            return "local"
-        if normalised == "init_scaling_ablation":
-            return "init_scaling_ablation"
-        raise ValueError(
-            f"Unsupported initialization_strategy={initialization_strategy!r}. "
-            "Expected 'local' or 'init_scaling_ablation'."
-        )
-
-    @staticmethod
     def _normalise_explicit_init_mode(mode: str) -> ExplicitGrowthInitMode:
         """Validate explicit tensor init modes used when local init is disabled."""
         normalised = str(mode).lower().strip()
@@ -741,60 +653,6 @@ class GrowingGraphNetwork(GrowingContainer):
         raise ValueError(
             f"Unsupported growth initialization mode {mode!r}. "
             "Expected one of: kaiming, zeros"
-        )
-
-    @staticmethod
-    def _restore_init_scaling_post_merge_functions_in_dag(dag: GrowingDAG) -> None:
-        """Restore post-merge functions wrapped for candidate evaluation."""
-        for node in list(dag.nodes):
-            merge_module = dag.get_node_module(node)
-            original = getattr(
-                merge_module, "_init_scaling_original_post_merge_function", None
-            )
-            if original is None:
-                continue
-            merge_module.post_merge_function = original
-            delattr(merge_module, "_init_scaling_original_post_merge_function")
-
-    def _restore_init_scaling_post_merge_functions(self) -> None:
-        """Restore temporary ablation wrappers on this graph."""
-        self._restore_init_scaling_post_merge_functions_in_dag(self.dag)
-
-    @classmethod
-    def _restore_init_scaling_post_merge_functions_for_options(
-        cls,
-        options: Sequence[Expansion],
-    ) -> None:
-        """Restore temporary wrappers on every candidate DAG."""
-        for option in options:
-            cls._restore_init_scaling_post_merge_functions_in_dag(option.dag)
-
-    @staticmethod
-    def _wrap_expansion_post_merge_function(
-        expansion: Expansion,
-        extension_size: int,
-    ) -> None:
-        """Wrap merge post-processing while candidate extensions are evaluated."""
-        if expansion.type == ExpansionType.NEW_EDGE:
-            return
-        expanding_node = expansion.expanding_node
-        if expanding_node not in expansion.dag.nodes:
-            return
-
-        merge_module = expansion.dag.get_node_module(expanding_node)
-        if isinstance(
-            merge_module.post_merge_function,
-            _ExtendedPostMergeFunctionAdapter,
-        ):
-            return
-
-        merge_module._init_scaling_original_post_merge_function = (  # type: ignore[attr-defined]
-            merge_module.post_merge_function
-        )
-        merge_module.post_merge_function = _ExtendedPostMergeFunctionAdapter(
-            post_merge_function=merge_module.post_merge_function,
-            base_features=int(expansion.dag.nodes[expanding_node]["size"]),
-            extension_features=extension_size,
         )
 
     @staticmethod
@@ -901,6 +759,7 @@ class GrowingGraphNetwork(GrowingContainer):
         incoming_init: ExplicitGrowthInitMode = "kaiming",
         outgoing_init: ExplicitGrowthInitMode = "zeros",
         new_edge_init: ExplicitGrowthInitMode = "zeros",
+        overwrite_existing: bool = False,
     ) -> None:
         """Initialize a DAG expansion without running the local initializer."""
         incoming_init = cls._normalise_explicit_init_mode(incoming_init)
@@ -926,18 +785,17 @@ class GrowingGraphNetwork(GrowingContainer):
             )
 
         for edge in expansion.in_edges:
-            if edge.extended_output_layer is None:
+            if overwrite_existing or edge.extended_output_layer is None:
                 cls._create_output_extension_from_mode(
                     edge, extension_size, incoming_init
                 )
             edge.output_extension_scaling = 1.0
 
         for edge in expansion.out_edges:
-            if edge.extended_input_layer is None:
+            if overwrite_existing or edge.extended_input_layer is None:
                 cls._create_input_extension_from_mode(edge, extension_size, outgoing_init)
             edge.scaling_factor = 1.0
 
-        cls._wrap_expansion_post_merge_function(expansion, extension_size)
         expansion.metrics["active_neurons"] = extension_size
 
     def update_edge_weights(
@@ -1125,10 +983,6 @@ class GrowingGraphNetwork(GrowingContainer):
         dev_dataloader: DataLoader = None,
         val_dataloader: DataLoader = None,
         verbose: bool = False,
-        initialization_strategy: GrowthInitializationStrategy = "local",
-        incoming_init: ExplicitGrowthInitMode = "kaiming",
-        outgoing_init: ExplicitGrowthInitMode = "zeros",
-        new_edge_init: ExplicitGrowthInitMode = "zeros",
     ) -> None:
         """Execute all DAG expansions and save statistics
 
@@ -1154,24 +1008,7 @@ class GrowingGraphNetwork(GrowingContainer):
             validation dataloader, used if evaluate=True
         verbose : bool, optional
             print info, by default False
-        initialization_strategy : GrowthInitializationStrategy, optional
-            "local" keeps the standard learned initialization. "init_scaling_ablation"
-            skips it and initializes each candidate directly from the init modes.
-        incoming_init : ExplicitGrowthInitMode, optional
-            Incoming-edge initialization for "init_scaling_ablation".
-        outgoing_init : ExplicitGrowthInitMode, optional
-            Outgoing-edge initialization for "init_scaling_ablation".
-        new_edge_init : ExplicitGrowthInitMode, optional
-            Direct-edge initialization for "init_scaling_ablation".
         """
-        initialization_strategy = self._normalise_initialization_strategy(
-            initialization_strategy
-        )
-        if initialization_strategy == "init_scaling_ablation":
-            incoming_init = self._normalise_explicit_init_mode(incoming_init)
-            outgoing_init = self._normalise_explicit_init_mode(outgoing_init)
-            new_edge_init = self._normalise_explicit_init_mode(new_edge_init)
-
         if amplitude_factor:
             assert dev_dataloader is not None, (
                 "Development DataLoader should be given if amplitude_factor is True"
@@ -1201,23 +1038,13 @@ class GrowingGraphNetwork(GrowingContainer):
                     self.global_step,
                 )
 
-                if initialization_strategy == "init_scaling_ablation":
-                    self.initialise_expansion_from_modes(
-                        expansion=expansion,
-                        extension_size=self.neurons,
-                        incoming_init=incoming_init,
-                        outgoing_init=outgoing_init,
-                        new_edge_init=new_edge_init,
-                    )
-                    bott_loss_history = [0.0]
-                else:
-                    # Update weight of next_node's incoming edge
-                    bott_loss_history = self.update_edge_weights(
-                        expansion=expansion,
-                        bottlenecks=bottleneck,
-                        activities=input_B,
-                        verbose=verbose,
-                    )
+                # Update weight of next_node's incoming edge
+                bott_loss_history = self.update_edge_weights(
+                    expansion=expansion,
+                    bottlenecks=bottleneck,
+                    activities=input_B,
+                    verbose=verbose,
+                )
 
             # Create/Expand node
             elif (expansion.type == ExpansionType.NEW_NODE) or (
@@ -1229,24 +1056,14 @@ class GrowingGraphNetwork(GrowingContainer):
                     self.global_step,
                 )
 
-                if initialization_strategy == "init_scaling_ablation":
-                    self.initialise_expansion_from_modes(
-                        expansion=expansion,
-                        extension_size=self.neurons,
-                        incoming_init=incoming_init,
-                        outgoing_init=outgoing_init,
-                        new_edge_init=new_edge_init,
-                    )
-                    bott_loss_history = [0.0]
-                else:
-                    # Update weights of new edges
-                    bott_loss_history = self.expand_node(
-                        expansion=expansion,
-                        bottlenecks=bottleneck,
-                        activities=input_B,
-                        neuron_selection_threshold=neuron_selection_threshold,
-                        verbose=verbose,
-                    )
+                # Update weights of new edges
+                bott_loss_history = self.expand_node(
+                    expansion=expansion,
+                    bottlenecks=bottleneck,
+                    activities=input_B,
+                    neuron_selection_threshold=neuron_selection_threshold,
+                    verbose=verbose,
+                )
                 if expansion.metrics.get("skip", False):
                     continue
 
@@ -1379,8 +1196,6 @@ class GrowingGraphNetwork(GrowingContainer):
             list of all possible extensions
         """
         assert self.chosen_action is not None
-        self._restore_init_scaling_post_merge_functions()
-        self._restore_init_scaling_post_merge_functions_for_options(options)
 
         # Make selected nodes and edges non candidate
         if self.chosen_action.dag == self.dag:
@@ -1432,12 +1247,19 @@ class GrowingGraphNetwork(GrowingContainer):
 
     def apply_change(self) -> None:
         """Apply all changes to the graph"""
-        self._restore_init_scaling_post_merge_functions()
+        init_strategy = self.chosen_action.metrics.get("initialization_strategy")
         # Apply changes
         for prev_node, next_node in self.dag.edges:
             factor = self.chosen_action.metrics["scaling_factor"]
             edge_module = self.dag.get_edge_module(prev_node, next_node)
 
+            if (
+                init_strategy == "init_scaling_ablation"
+                and edge_module.extended_input_layer is not None
+                and edge_module.extended_input_layer.bias is not None
+            ):
+                with torch.no_grad():
+                    edge_module.extended_input_layer.bias.zero_()
             edge_module.scaling_factor = factor
             edge_module.output_extension_scaling = factor  # type: ignore
             edge_module.apply_change(scaling_factor=factor, apply_previous=False)
