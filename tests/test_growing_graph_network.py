@@ -304,6 +304,62 @@ class TestGrowingGraphNetwork(TorchTestCase):
     def test_inter_training(self) -> None:
         pass
 
+    def test_apply_expansion_rescaling_noop_when_disabled(self) -> None:
+        expansion = Expansion(
+            self.net.dag,
+            ExpansionType.EXPANDED_NODE,
+            expanding_node="1",
+        )
+        in_edge = self.net.dag.get_edge_module(self.net.dag.root, "1")
+        out_edge = self.net.dag.get_edge_module("1", self.net.dag.end)
+        in_weight = in_edge.weight.detach().clone()
+        out_weight = out_edge.weight.detach().clone()
+
+        metrics = self.net.apply_expansion_rescaling(
+            expansion=expansion,
+            rescaling=None,
+            extension_size=2,
+        )
+
+        self.assertEqual(metrics, {})
+        self.assertTrue(torch.allclose(in_edge.weight, in_weight))
+        self.assertTrue(torch.allclose(out_edge.weight, out_weight))
+
+    def test_apply_expansion_rescaling_uses_merged_fan_in(self) -> None:
+        self.net.dag.add_direct_edge(self.net.dag.root, self.net.dag.end)
+        expansion = Expansion(
+            self.net.dag,
+            ExpansionType.EXPANDED_NODE,
+            expanding_node="1",
+        )
+        in_edge = self.net.dag.get_edge_module(self.net.dag.root, "1")
+        out_edge = self.net.dag.get_edge_module("1", self.net.dag.end)
+        bypass_edge = self.net.dag.get_edge_module(self.net.dag.root, self.net.dag.end)
+        bypass_weight = bypass_edge.weight.detach().clone()
+
+        out_target_fan_in = out_edge.get_fan_in_from_layer(
+            out_edge.layer
+        ) + bypass_edge.get_fan_in_from_layer(bypass_edge.layer)
+
+        metrics = self.net.apply_expansion_rescaling(
+            expansion=expansion,
+            rescaling="vt_constraint_old_shape",
+            extension_size=2,
+        )
+
+        self.assertEqual(metrics["rescaled_edges"], 2.0)
+        self.assertAlmostEqual(
+            in_edge.weight.var().item(),
+            1 / in_edge.get_fan_in_from_layer(in_edge.layer),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            out_edge.weight.var().item(),
+            1 / out_target_fan_in,
+            places=5,
+        )
+        self.assertTrue(torch.allclose(bypass_edge.weight, bypass_weight))
+
     @unittest_parametrize(({"evaluate": True}, {"evaluate": False}))
     def test_execute_expansions(self, evaluate: bool) -> None:
         with self.assertWarnsRegex(

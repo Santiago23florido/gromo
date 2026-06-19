@@ -33,6 +33,9 @@ from gromo.utils.utils import (
 
 
 ExplicitGrowthInitMode: TypeAlias = Literal["kaiming", "zeros"]
+ExpansionRescalingStrategy: TypeAlias = Literal[
+    "default_vt", "vt_constraint_old_shape", "vt_constraint_new_shape"
+]
 
 
 class GrowingGraphNetwork(GrowingContainer):
@@ -355,6 +358,142 @@ class GrowingGraphNetwork(GrowingContainer):
         """
         # TODO
         raise NotImplementedError("Joint optimization of weights is not implemented yet!")
+
+    @staticmethod
+    def _normalise_expansion_rescaling_strategy(
+        rescaling: ExpansionRescalingStrategy | str | None,
+    ) -> ExpansionRescalingStrategy | None:
+        if rescaling is None:
+            return None
+
+        normalised = str(rescaling).strip()
+        if normalised in ("", "none", "null"):
+            return None
+        if normalised in (
+            "default_vt",
+            "vt_constraint_old_shape",
+            "vt_constraint_new_shape",
+        ):
+            return normalised  # type: ignore[return-value]
+        raise ValueError(
+            f"Unsupported expansion rescaling strategy {rescaling!r}. "
+            "Expected one of: default_vt, vt_constraint_old_shape, "
+            "vt_constraint_new_shape"
+        )
+
+    @staticmethod
+    def _edge_fan_in(edge: GrowingModule) -> int:
+        return edge.get_fan_in_from_layer(edge.layer)
+
+    @classmethod
+    def _total_fan_in_to_next_module(cls, edge: GrowingModule) -> int:
+        """Total fan-in entering an edge receiver in a potentially merged DAG."""
+        next_module = getattr(edge, "next_module", None)
+        previous_modules = getattr(next_module, "previous_modules", None)
+        if not previous_modules:
+            return cls._edge_fan_in(edge)
+
+        total_fan_in = 0
+        for previous_module in previous_modules:
+            if isinstance(previous_module, GrowingModule):
+                total_fan_in += cls._edge_fan_in(previous_module)
+        return total_fan_in if total_fan_in > 0 else cls._edge_fan_in(edge)
+
+    @staticmethod
+    def _scale_edge_weights(edge: GrowingModule, scale: float) -> None:
+        if scale == 1.0:
+            return
+        edge.weight.data.mul_(scale)
+        if edge.bias is not None:
+            edge.bias.data.mul_(scale)
+        edge._rescale_post_layer_function(edge.post_layer_function, scale)
+
+    @classmethod
+    def _variance_transfer_scale(
+        cls,
+        edge: GrowingModule,
+        target_fan_in: int,
+    ) -> float:
+        var_w = edge.weight.var().item()
+        if target_fan_in <= 0 or var_w <= 0:
+            return 1.0
+        return (1.0 / (target_fan_in * var_w)) ** 0.5
+
+    @torch.no_grad()
+    def apply_expansion_rescaling(
+        self,
+        expansion: Expansion | None = None,
+        rescaling: ExpansionRescalingStrategy | str | None = None,
+        extension_size: int | None = None,
+    ) -> dict[str, float]:
+        """Apply variance-transfer rescaling to a selected DAG expansion.
+
+        This mutates existing weights, so callers should use it only on the
+        expansion that will be committed, not on every candidate evaluated by
+        ``execute_expansions``.
+        """
+        rescaling = self._normalise_expansion_rescaling_strategy(rescaling)
+        if rescaling is None:
+            return {}
+
+        if expansion is None:
+            expansion = self.chosen_action
+        if expansion is None:
+            raise ValueError("apply_expansion_rescaling requires an expansion")
+
+        expansion.metrics["variance_transfer_rescaling"] = rescaling
+        if expansion.type == ExpansionType.NEW_EDGE:
+            expansion.metrics["variance_transfer_rescaled_edges"] = 0
+            return {"rescaled_edges": 0.0}
+
+        if extension_size is None:
+            extension_size = int(expansion.metrics.get("active_neurons", self.neurons))
+        if extension_size <= 0:
+            expansion.metrics["variance_transfer_rescaled_edges"] = 0
+            return {"rescaled_edges": 0.0}
+
+        scales: list[float] = []
+
+        for edge in expansion.in_edges:
+            if rescaling == "default_vt":
+                scale = 1.0
+            else:
+                scale = self._variance_transfer_scale(
+                    edge,
+                    self._total_fan_in_to_next_module(edge),
+                )
+            self._scale_edge_weights(edge, scale)
+            scales.append(scale)
+
+        for edge in expansion.out_edges:
+            old_fan_in = self._total_fan_in_to_next_module(edge)
+            extension_fan_in = edge.get_fan_in_from_layer(num_neurons=extension_size)
+            if rescaling == "default_vt":
+                scale = (old_fan_in / (old_fan_in + extension_fan_in)) ** 0.5
+            elif rescaling == "vt_constraint_old_shape":
+                scale = self._variance_transfer_scale(edge, old_fan_in)
+            else:
+                scale = self._variance_transfer_scale(
+                    edge,
+                    old_fan_in + extension_fan_in,
+                )
+            self._scale_edge_weights(edge, scale)
+            scales.append(scale)
+
+        expansion.metrics["variance_transfer_rescaled_edges"] = len(scales)
+        if not scales:
+            return {"rescaled_edges": 0.0}
+
+        metrics = {
+            "rescaled_edges": float(len(scales)),
+            "scale_mean": float(np.mean(scales)),
+            "scale_min": float(np.min(scales)),
+            "scale_max": float(np.max(scales)),
+        }
+        expansion.metrics["variance_transfer_scale_mean"] = metrics["scale_mean"]
+        expansion.metrics["variance_transfer_scale_min"] = metrics["scale_min"]
+        expansion.metrics["variance_transfer_scale_max"] = metrics["scale_max"]
+        return metrics
 
     def expand_node(
         self,
