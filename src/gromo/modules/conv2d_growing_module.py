@@ -120,9 +120,14 @@ class Conv2dMergeGrowingModule(MergeGrowingModule):
         """
         if self.input_size is not None:
             with torch.no_grad():
+                was_training = self.post_merge_function.training
                 x = torch.zeros(1, self.in_channels, *self.input_size, device=self.device)
-                x = self.post_merge_function(x)
-                x = self.reshape_function(x)
+                try:
+                    self.post_merge_function.eval()
+                    x = self.post_merge_function(x)
+                    x = self.reshape_function(x)
+                finally:
+                    self.post_merge_function.train(was_training)
                 return prod(x.shape)
         return self.input_volume
 

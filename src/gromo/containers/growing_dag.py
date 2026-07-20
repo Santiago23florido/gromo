@@ -15,7 +15,11 @@ from gromo.modules.conv2d_growing_module import (
     FullConv2dGrowingModule,
 )
 from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
-from gromo.modules.growing_normalisation import GrowingLayerNorm
+from gromo.modules.growing_normalisation import (
+    GrowingBatchNorm1d,
+    GrowingBatchNorm2d,
+    GrowingLayerNorm,
+)
 from gromo.modules.linear_growing_module import (
     LinearGrowingModule,
     LinearMergeGrowingModule,
@@ -48,6 +52,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         use bias
     use_layer_norm : bool
         use Layer Normalization
+    use_batch_norm : bool, optional
+        use Batch Normalization instead of Layer Normalization, by default False
     default_layer_type : str, optional
         the type of layer operations, to choose between "linear" and "convolution", by default "linear"
     activation : str, optional
@@ -81,7 +87,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         out_features: int,
         neurons: int,
         use_bias: bool,
-        use_layer_norm: bool,
+        use_layer_norm: bool = False,
+        use_batch_norm: bool = False,
         default_layer_type: str = "linear",
         activation: str = "selu",
         kernel_size: tuple[int, int] = (3, 3),
@@ -102,6 +109,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         self.neurons = neurons
         self.use_bias = use_bias
         self.use_layer_norm = use_layer_norm
+        self.use_batch_norm = use_batch_norm
         self.activation = activation
         self.kernel_size = kernel_size
         if "_" in name:
@@ -220,6 +228,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "shape": self.input_shape,
                 "kernel_size": self.kernel_size,
                 "use_layer_norm": False,
+                "use_batch_norm": False,
             },
             self.end: {
                 "type": self.layer_type,
@@ -227,6 +236,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "shape": self.input_shape,
                 "kernel_size": self.kernel_size,
                 "use_layer_norm": self.use_layer_norm,
+                "use_batch_norm": self.use_batch_norm,
             },
         }
         edge_attributes = {
@@ -258,6 +268,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "kernel_size": self.kernel_size,
                 "activation": self.activation if node != self.root else "id",
                 "use_layer_norm": self.use_layer_norm if node != self.root else False,
+                "use_batch_norm": self.use_batch_norm if node != self.root else False,
             }
             for node, value in self.nodes.items()
         }
@@ -687,14 +698,25 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
 
             self.nodes[node].update(attributes)
 
-            layer_norm = nn.Identity()
+            normalization = nn.Identity()
+            use_batch_norm = attributes.get("use_batch_norm", self.use_batch_norm)
+            use_layer_norm = (
+                attributes.get("use_layer_norm", self.use_layer_norm)
+                and not use_batch_norm
+            )
 
             name = node.split("_")[0]
             if self.nodes[node]["type"] == "linear":
                 in_features = self.nodes[node]["size"]
 
-                if attributes.get("use_layer_norm", self.use_layer_norm):
-                    layer_norm = GrowingLayerNorm(
+                if use_batch_norm:
+                    normalization = GrowingBatchNorm1d(
+                        in_features,
+                        affine=False,
+                        device=self.device,
+                    )
+                elif use_layer_norm:
+                    normalization = GrowingLayerNorm(
                         in_features, elementwise_affine=False, device=self.device
                     )
 
@@ -703,7 +725,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     LinearMergeGrowingModule(
                         in_features=in_features,
                         post_merge_function=torch.nn.Sequential(
-                            layer_norm,
+                            normalization,
                             activation_fn(self.nodes[node].get("activation")),
                         ),
                         allow_growing=True,
@@ -721,12 +743,18 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     else None
                 )
 
-                if attributes.get("use_layer_norm", self.use_layer_norm):
+                if use_batch_norm:
+                    normalization = GrowingBatchNorm2d(
+                        in_channels,
+                        affine=False,
+                        device=self.device,
+                    )
+                elif use_layer_norm:
                     if "shape" not in attributes:
                         raise KeyError(
                             'The shape of the input (h,w) should be specified at initialization when using LayerNorm. Example: key "shape" in node_attributes[new_node]'
                         )
-                    layer_norm = GrowingLayerNorm(
+                    normalization = GrowingLayerNorm(
                         [in_channels, *input_size],
                         elementwise_affine=False,
                         device=self.device,
@@ -740,7 +768,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                         next_kernel_size=kernel_size,
                         input_volume=input_volume,
                         post_merge_function=torch.nn.Sequential(
-                            layer_norm,
+                            normalization,
                             activation_fn(self.nodes[node].get("activation")),
                         ),
                         allow_growing=True,
