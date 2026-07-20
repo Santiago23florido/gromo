@@ -61,8 +61,6 @@ class GrowingGraphNetwork(GrowingContainer):
         automatically use bias in the layers, by default True
     use_layer_norm : bool, optional
         use layer normalization on the last layer, by default False
-    use_batch_norm : bool, optional
-        use batch normalization instead of layer normalization, by default False
     layer_type : str, optional
         the type of the layers used to choose between "linear" and "convolution", by default "linear"
     name : str, optional
@@ -71,6 +69,8 @@ class GrowingGraphNetwork(GrowingContainer):
         the expected shape of the input excluding batch size and channels, by default None
     device : str | None, optional
         default device, by default None
+    use_batch_norm : bool, optional
+        use batch normalization instead of layer normalization, by default False
     """
 
     def __init__(
@@ -84,11 +84,11 @@ class GrowingGraphNetwork(GrowingContainer):
         neuron_batch_size: int = 256,
         use_bias: bool = True,
         use_layer_norm: bool = False,
-        use_batch_norm: bool = False,
         layer_type: str = "linear",
         name: str = "",
         input_shape: tuple[int, int] | None = None,
         device: str | None = None,
+        use_batch_norm: bool = False,
     ) -> None:
         super(GrowingGraphNetwork, self).__init__(
             in_features=in_features,

@@ -52,8 +52,6 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         use bias
     use_layer_norm : bool
         use Layer Normalization
-    use_batch_norm : bool, optional
-        use Batch Normalization instead of Layer Normalization, by default False
     default_layer_type : str, optional
         the type of layer operations, to choose between "linear" and "convolution", by default "linear"
     activation : str, optional
@@ -72,6 +70,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         configuration dictionary to create a custom initial dag, by default None
     device : torch.device | str | None, optional
         default device, by default None
+    use_batch_norm : bool, optional
+        use Batch Normalization instead of Layer Normalization, by default False
 
     Raises
     ------
@@ -88,7 +88,6 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         neurons: int,
         use_bias: bool,
         use_layer_norm: bool = False,
-        use_batch_norm: bool = False,
         default_layer_type: str = "linear",
         activation: str = "selu",
         kernel_size: tuple[int, int] = (3, 3),
@@ -98,6 +97,7 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         input_shape: tuple[int, int] | None = None,
         DAG_parameters: dict | None = None,
         device: torch.device | str | None = None,
+        use_batch_norm: bool = False,
     ) -> None:
         nx.DiGraph.__init__(self)
         GrowingContainer.__init__(
