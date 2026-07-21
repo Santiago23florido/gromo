@@ -18,6 +18,7 @@ from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
 from gromo.modules.growing_normalisation import (
     GrowingBatchNorm1d,
     GrowingBatchNorm2d,
+    GrowingGroupNorm,
     GrowingLayerNorm,
 )
 from gromo.modules.linear_growing_module import (
@@ -72,6 +73,10 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         default device, by default None
     use_batch_norm : bool, optional
         use Batch Normalization instead of Layer Normalization, by default False
+    use_group_norm : bool, optional
+        use Group Normalization instead of Batch/Layer Normalization, by default False
+    group_norm_num_groups : int, optional
+        number of groups used when Group Normalization is enabled, by default 1
 
     Raises
     ------
@@ -98,6 +103,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         DAG_parameters: dict | None = None,
         device: torch.device | str | None = None,
         use_batch_norm: bool = False,
+        use_group_norm: bool = False,
+        group_norm_num_groups: int = 1,
     ) -> None:
         nx.DiGraph.__init__(self)
         GrowingContainer.__init__(
@@ -110,6 +117,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
         self.use_bias = use_bias
         self.use_layer_norm = use_layer_norm
         self.use_batch_norm = use_batch_norm
+        self.use_group_norm = use_group_norm
+        self.group_norm_num_groups = group_norm_num_groups
         self.activation = activation
         self.kernel_size = kernel_size
         if "_" in name:
@@ -229,6 +238,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "kernel_size": self.kernel_size,
                 "use_layer_norm": False,
                 "use_batch_norm": False,
+                "use_group_norm": False,
+                "group_norm_num_groups": self.group_norm_num_groups,
             },
             self.end: {
                 "type": self.layer_type,
@@ -237,6 +248,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "kernel_size": self.kernel_size,
                 "use_layer_norm": self.use_layer_norm,
                 "use_batch_norm": self.use_batch_norm,
+                "use_group_norm": self.use_group_norm,
+                "group_norm_num_groups": self.group_norm_num_groups,
             },
         }
         edge_attributes = {
@@ -269,6 +282,8 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                 "activation": self.activation if node != self.root else "id",
                 "use_layer_norm": self.use_layer_norm if node != self.root else False,
                 "use_batch_norm": self.use_batch_norm if node != self.root else False,
+                "use_group_norm": self.use_group_norm if node != self.root else False,
+                "group_norm_num_groups": self.group_norm_num_groups,
             }
             for node, value in self.nodes.items()
         }
@@ -699,17 +714,27 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
             self.nodes[node].update(attributes)
 
             normalization = nn.Identity()
+            use_group_norm = attributes.get("use_group_norm", self.use_group_norm)
             use_batch_norm = attributes.get("use_batch_norm", self.use_batch_norm)
-            use_layer_norm = (
-                attributes.get("use_layer_norm", self.use_layer_norm)
-                and not use_batch_norm
+            use_layer_norm = attributes.get(
+                "use_layer_norm", self.use_layer_norm
+            ) and not (use_batch_norm or use_group_norm)
+            group_norm_num_groups = int(
+                attributes.get("group_norm_num_groups", self.group_norm_num_groups)
             )
 
             name = node.split("_")[0]
             if self.nodes[node]["type"] == "linear":
                 in_features = self.nodes[node]["size"]
 
-                if use_batch_norm:
+                if use_group_norm:
+                    normalization = GrowingGroupNorm(
+                        group_norm_num_groups,
+                        in_features,
+                        affine=False,
+                        device=self.device,
+                    )
+                elif use_batch_norm:
                     normalization = GrowingBatchNorm1d(
                         in_features,
                         affine=False,
@@ -743,7 +768,14 @@ class GrowingDAG(nx.DiGraph, GrowingContainer):
                     else None
                 )
 
-                if use_batch_norm:
+                if use_group_norm:
+                    normalization = GrowingGroupNorm(
+                        group_norm_num_groups,
+                        in_channels,
+                        affine=False,
+                        device=self.device,
+                    )
+                elif use_batch_norm:
                     normalization = GrowingBatchNorm2d(
                         in_channels,
                         affine=False,

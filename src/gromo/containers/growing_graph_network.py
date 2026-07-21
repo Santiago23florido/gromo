@@ -71,6 +71,10 @@ class GrowingGraphNetwork(GrowingContainer):
         default device, by default None
     use_batch_norm : bool, optional
         use batch normalization instead of layer normalization, by default False
+    use_group_norm : bool, optional
+        use group normalization instead of batch/layer normalization, by default False
+    group_norm_num_groups : int, optional
+        number of groups used when group normalization is enabled, by default 1
     """
 
     def __init__(
@@ -89,6 +93,8 @@ class GrowingGraphNetwork(GrowingContainer):
         input_shape: tuple[int, int] | None = None,
         device: str | None = None,
         use_batch_norm: bool = False,
+        use_group_norm: bool = False,
+        group_norm_num_groups: int = 1,
     ) -> None:
         super(GrowingGraphNetwork, self).__init__(
             in_features=in_features,
@@ -98,6 +104,8 @@ class GrowingGraphNetwork(GrowingContainer):
         self.use_bias = use_bias
         self.use_layer_norm = use_layer_norm
         self.use_batch_norm = use_batch_norm
+        self.use_group_norm = use_group_norm
+        self.group_norm_num_groups = group_norm_num_groups
         self.layer_type = layer_type
         self._name = name
         self.input_shape = input_shape
@@ -177,6 +185,8 @@ class GrowingGraphNetwork(GrowingContainer):
             use_bias=self.use_bias,
             use_layer_norm=self.use_layer_norm,
             use_batch_norm=self.use_batch_norm,
+            use_group_norm=self.use_group_norm,
+            group_norm_num_groups=self.group_norm_num_groups,
             default_layer_type=self.layer_type,
             name=self._name,
             input_shape=self.input_shape,
