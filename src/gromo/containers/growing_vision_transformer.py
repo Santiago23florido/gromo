@@ -637,7 +637,12 @@ class GrowingTransformer(SequentialGrowingModel):
         scheduling_method: str = "all",
         index: int | None = None,
     ) -> None:
-        """Select all blocks, the next block, or one specific block for growth."""
+        """Select growth blocks in this outer model only.
+
+        The outer model owns an independent scheduling state and directly references
+        the classifier's growable blocks. The classifier's scheduling state is not
+        modified; configure it explicitly when using the classifier independently.
+        """
         self._growable_layers = _block_growth_targets(self.classifier.blocks)
         super().set_growing_layers(
             scheduling_method=scheduling_method,
@@ -1005,7 +1010,12 @@ class GrowingTextViTLite(SequentialGrowingModel):
         scheduling_method: str = "all",
         index: int | None = None,
     ) -> None:
-        """Select all blocks, the next block, or one specific block for growth."""
+        """Select growth blocks in this outer model only.
+
+        The outer model owns an independent scheduling state and directly references
+        the classifier's growable blocks. The classifier's scheduling state is not
+        modified; configure it explicitly when using the classifier independently.
+        """
         self._growable_layers = _block_growth_targets(self.classifier.blocks)
         super().set_growing_layers(
             scheduling_method=scheduling_method,
