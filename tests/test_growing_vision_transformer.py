@@ -100,6 +100,7 @@ class TestGrowingTransformer(TorchTestCase):
         self.assertEqual(self.model.layer_to_grow_index, 1)
         self.assertEqual(len(self.model._growing_layers), 1)
         self.assertIs(self.model._growing_layers[0], self.model.blocks[1].mlp)
+        self.assertEqual(self.model.classifier.layer_to_grow_index, -1)
 
     def test_set_growing_layers_sequential(self):
         self.model.set_growing_layers(scheduling_method="sequential")
@@ -328,6 +329,7 @@ class TestGrowingTransformer(TorchTestCase):
         self.assertEqual(model.layer_to_grow_index, 1)
         self.assertEqual(len(model._growing_layers), 1)
         self.assertIs(model._growing_layers[0], model.classifier.blocks[1].mlp)
+        self.assertEqual(model.classifier.layer_to_grow_index, -1)
 
 
 class TestGrowingTransformerCoveragePaths(TorchTestCase):
