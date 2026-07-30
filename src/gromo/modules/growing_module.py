@@ -1,5 +1,14 @@
 import warnings
-from typing import Any, Iterator, Literal, Protocol, get_args, runtime_checkable
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Iterable,
+    Iterator,
+    Literal,
+    Protocol,
+    get_args,
+    runtime_checkable,
+)
 
 import numpy as np
 import torch
@@ -19,6 +28,67 @@ from gromo.utils.utils import (
 
 # Constants for gradient computation
 GRADIENT_COMPUTATION_EPSILON = 1e-5  # Small perturbation for gradient computation
+
+_skip_capture_under_functorch = False
+
+
+def set_skip_capture_under_functorch(enabled: bool) -> None:
+    """Control whether statistics capture is skipped inside a functorch transform.
+
+    This setting is disabled by default, preserving the existing capture behavior.
+    When enabled, :class:`GrowingModule` skips input and pre-activity capture while
+    ``torch._C._functorch.peek_interpreter_stack()`` reports an active transform.
+    This private API is available in current PyTorch releases; builds that do not
+    provide it degrade to the default capture behavior.
+
+    Parameters
+    ----------
+    enabled : bool
+        Whether to skip capture under ``torch.func`` transforms.
+    """
+    global _skip_capture_under_functorch
+    _skip_capture_under_functorch = enabled
+
+
+def _functorch_transform_is_active() -> bool:
+    """Return whether PyTorch reports an active functorch interpreter."""
+    functorch = getattr(torch._C, "_functorch", None)
+    if functorch is None:
+        return False
+    peek_interpreter_stack = getattr(functorch, "peek_interpreter_stack", None)
+    if peek_interpreter_stack is None:
+        return False
+    return peek_interpreter_stack() is not None
+
+
+def _capture_is_suspended_under_functorch() -> bool:
+    """Return whether capture is currently disabled by the opt-in setting."""
+    return _skip_capture_under_functorch and _functorch_transform_is_active()
+
+
+def _iter_growing_modules_with_previous(
+    modules: Iterable[torch.nn.Module],
+) -> Iterator["GrowingModule"]:
+    """Iterate over growing modules and recursively follow predecessor links."""
+    pending = list(modules)
+    visited: set[int] = set()
+    while pending:
+        module = pending.pop()
+        if id(module) in visited:
+            continue
+        visited.add(id(module))
+        if isinstance(module, GrowingModule):
+            yield module
+            if isinstance(
+                module.previous_module,
+                (GrowingModule, MergeGrowingModule),
+            ):
+                pending.append(module.previous_module)
+        elif isinstance(module, MergeGrowingModule):
+            pending.extend(module.previous_modules)
+        else:
+            pending.extend(module.children())
+            pending.extend(getattr(module, "_growing_layers", ()))
 
 
 class MergeGrowingModule(torch.nn.Module):
@@ -1145,6 +1215,37 @@ class GrowingModule(torch.nn.Module):
     def __repr__(self, *args: Any, **kwargs: Any):
         return self.__str__(*args, **kwargs)
 
+    @property
+    def is_recording_statistics(self) -> bool:
+        """Whether this module would capture input or pre-activity on its next forward."""
+        return bool(
+            (self._internal_store_input or self._internal_store_pre_activity)
+            and not _capture_is_suspended_under_functorch()
+        )
+
+    @contextmanager
+    def paused_computation(self) -> Iterator[None]:
+        """Suspend capture without discarding accumulated statistics.
+
+        Unlike :meth:`reset_computation`, this context manager does not reset any
+        :class:`TensorStatistic` state. This is the supported way to run an evaluation
+        forward inside a growth-statistics session. It pauses this module and every
+        growing predecessor reachable through merge links.
+        """
+        modules = list(_iter_growing_modules_with_previous([self]))
+        stored_flags = [
+            (module, module.store_input, module.store_pre_activity) for module in modules
+        ]
+        try:
+            for module, _, _ in stored_flags:
+                module.store_input = False
+                module.store_pre_activity = False
+            yield
+        finally:
+            for module, store_input, store_pre_activity in reversed(stored_flags):
+                module.store_input = store_input
+                module.store_pre_activity = store_pre_activity
+
     def __setattr__(self, key, value):
         if key == "store_input" and value is not self.store_input:
             self.__dict__["store_input"] = value
@@ -1236,12 +1337,14 @@ class GrowingModule(torch.nn.Module):
             # TODO: change this condition by using self._allow_growing
             self.tensor_s_growth.updated = False
 
-        if self._internal_store_input:
+        capture_statistics = not _capture_is_suspended_under_functorch()
+
+        if capture_statistics and self._internal_store_input:
             self._input = x.detach()
 
         pre_activity: torch.Tensor = self.layer(x)
 
-        if self._internal_store_pre_activity:
+        if capture_statistics and self._internal_store_pre_activity:
             self._pre_activity = pre_activity
             self._pre_activity.retain_grad()
 

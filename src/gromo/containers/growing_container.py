@@ -1,9 +1,14 @@
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import torch
 
 from gromo.config.loader import load_config
-from gromo.modules.growing_module import GrowingModule, MergeGrowingModule
+from gromo.modules.growing_module import (
+    GrowingModule,
+    MergeGrowingModule,
+    _iter_growing_modules_with_previous,
+)
 from gromo.utils.utils import get_correct_device
 
 
@@ -94,6 +99,36 @@ class GrowingContainer(torch.nn.Module):
         """Reset statistics computations for growth procedure"""
         for layer in self._growing_layers:
             layer.reset_computation()
+
+    @property
+    def is_recording_statistics(self) -> bool:
+        """Whether any contained growing module would capture on its next forward."""
+        modules = _iter_growing_modules_with_previous([self])
+        return any(module.is_recording_statistics for module in modules)
+
+    @contextmanager
+    def paused_computation(self) -> Iterator[None]:
+        """Suspend capture without discarding accumulated statistics.
+
+        Unlike :meth:`reset_computation`, this context manager does not reset any
+        :class:`TensorStatistic` state. This is the supported way to run an evaluation
+        forward inside a growth-statistics session. Every contained
+        :class:`GrowingModule`, including modules reached through predecessor links, is
+        paused.
+        """
+        modules = list(_iter_growing_modules_with_previous([self]))
+        stored_flags = [
+            (module, module.store_input, module.store_pre_activity) for module in modules
+        ]
+        try:
+            for module, _, _ in stored_flags:
+                module.store_input = False
+                module.store_pre_activity = False
+            yield
+        finally:
+            for module, store_input, store_pre_activity in reversed(stored_flags):
+                module.store_input = store_input
+                module.store_pre_activity = store_pre_activity
 
     def compute_optimal_delta(
         self,
